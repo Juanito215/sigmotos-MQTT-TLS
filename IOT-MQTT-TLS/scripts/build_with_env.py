@@ -43,9 +43,10 @@ cmd = ['pio', 'run']
 if len(sys.argv) > 1 and sys.argv[1] == 'upload':
     cmd += ['-t', 'upload']
 
-# agregar defines
-cmd += ['--project-option', f'build_flags={" ".join(env_vars)}']
+# set build flags in environment
+os.environ['PLATFORMIO_BUILD_FLAGS'] = " ".join(env_vars)
 
-print("Ejecutando:", " ".join(cmd))
+print("Ejecutando con PLATFORMIO_BUILD_FLAGS:", os.environ['PLATFORMIO_BUILD_FLAGS'])
+print("Comando:", " ".join(cmd))
 
 subprocess.run(cmd, check=True)

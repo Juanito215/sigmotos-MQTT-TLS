@@ -20,7 +20,41 @@ static String getMacAddress() {
     return String("ESP32-") + buf;
 }
 
+#include <ArduinoJson.h>
+#include "libota.h"
+
+// Función que se ejecuta cuando llega un mensaje de MQTT
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Mensaje recibido en topico: ");
+    Serial.println(topic);
+
+    // Convertimos el payload a String
+    String message = "";
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    Serial.println("Contenido: " + message);
+
+    // Parseamos el JSON para buscar la URL del OTA
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, message);
+
+    if (error) {
+        Serial.print("Fallo al leer JSON: ");
+        Serial.println(error.c_str());
+        return;
+    }
+
+    // Extraemos la URL de descarga
+    const char* url = doc["url"];
+    if (url) {
+        // Llamamos a la función de OTA
+        performOTA(String(url));
+    }
+}
+
 void reconnect() {
+    client.setCallback(mqttCallback);
     while (!client.connected()) {
 
         // PASO 1: Configurar el certificado raíz

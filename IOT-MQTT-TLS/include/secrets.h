@@ -12,4 +12,6 @@ extern const char* MQTT_PASSWORD_VALUE;
 
 extern const char* MQTT_TOPIC_SUB_VALUE;
 
+extern const char* root_ca;
+
 #endif

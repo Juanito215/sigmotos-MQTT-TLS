@@ -1,0 +1,1152 @@
+1. ¿Qué vas a construir?
+
+Al finalizar este codelab tendrás un sistema completo donde cada vez que crees una versión nueva de tu firmware, GitHub Actions lo subirá automáticamente a un bucket de AWS S3 organizado y versionado.
+
+Flujo completo
+
+Este flujo es el que usan equipos profesionales para distribuir firmwares a dispositivos IoT en producción.
+Beneficios de usar AWS S3
+
+Podemos decidir AWS S3 porque:
+
+    Es el servicio de almacenamiento más usado en la industria (referencia en casi todas las ofertas de trabajo DevOps)
+    Se integra nativamente con AWS IoT para actualizaciones OTA (Over-The-Air) futuras
+    El CLI aws s3 es muy intuitivo
+    GitHub Actions tiene acciones oficiales de AWS bien mantenidas
+    La capa gratuita incluye 5 GB por 12 meses (ideal para aprender)
+
+Objetivos de aprendizaje
+
+Al finalizar serás capaz de:
+
+    Explicar qué es object storage y en qué se diferencia de un sistema de archivos
+    Crear y configurar un bucket AWS S3 con versionado y control de acceso
+    Gestionar credenciales AWS con IAM siguiendo el principio de mínimo privilegio
+    Usar el CLI de AWS para subir y listar objetos
+    Crear un workflow de GitHub Actions que publique firmwares automáticamente al crear un git tag
+
+Prerequisitos
+
+    Cuenta de GitHub (gratuita)
+    Conocimiento básico de Git (commits y tags)
+    Terminal (bash, zsh o PowerShell)
+    Saber qué es un archivo binario (.bin)
+
+Lo que necesitas instalar
+
+    AWS CLI v2 — lo instalaremos en el Paso 4
+    Git — versión 2.x o superior
+
+
+. Conceptos: ¿Qué es Object Storage?
+
+Antes de crear nada, necesitas entender qué es lo que estás usando.
+Sistema de archivos vs Object Storage
+
+Cuando guardas un archivo en tu computadora, lo haces en un sistema de archivos (como NTFS en Windows o ext4 en Linux). Este sistema organiza los datos en carpetas y subcarpetas, formando una jerarquía.
+
+Object Storage (almacenamiento de objetos) es diferente:
+
+Característica
+	
+
+Sistema de archivos
+	
+
+Object Storage (S3)
+
+Organización
+	
+
+Carpetas jerárquicas
+	
+
+Plano (todo al mismo nivel)
+
+Identificación
+	
+
+Ruta del archivo
+	
+
+Clave única (key)
+
+Acceso
+	
+
+Local / red local
+	
+
+HTTP desde cualquier lugar del mundo
+
+Escala
+	
+
+Terabytes (limitado)
+	
+
+Exabytes (ilimitado)
+
+Modificación
+	
+
+Se puede editar en sitio
+	
+
+Reemplazar el objeto completo
+
+Precio
+	
+
+Costo del disco
+	
+
+Pago por lo que usas
+
+En S3 no existen carpetas reales. Cuando ves esp32/v1.0.0/firmware.bin, en realidad ese es el nombre completo del objeto (llamado key). La / es solo parte del nombre — S3 la interpreta visualmente como carpeta, pero internamente no hay jerarquía.
+Anatomía de AWS S3
+
+Bucket: Es el contenedor raíz. Su nombre debe ser único globalmente en todo AWS (como un dominio de internet). Tú eres el dueño del bucket.
+
+Objeto: Cada archivo almacenado. Tiene:
+
+    key — el nombre/ruta completo
+    body — el contenido del archivo (el binario del firmware)
+    metadata — información adicional (fecha, tamaño, etiquetas)
+
+Versionado en S3
+
+Cuando habilitas el versionado en un bucket, S3 guarda automáticamente cada versión de un objeto cuando lo sobreescribes.
+
+esp32/v1.0.0/firmware.bin  →  versión A (subida el lunes)
+esp32/v1.0.0/firmware.bin  →  versión B (sobreescrita el martes)
+
+Con versionado activado, ambas versiones existen. Puedes recuperar la versión A aunque hayas subido la B. Sin versionado, la versión A se pierde para siempre.
+Conceptos de IAM (Gestión de Identidad)
+
+IAM (Identity and Access Management) es el sistema de permisos de AWS. Define quién puede hacer qué con qué recursos.
+
+Componentes que usaremos:
+
+    Usuario IAM — una identidad programática (para scripts y CI/CD, no para humanos)
+    Política — un documento JSON que describe permisos (Allow o Deny sobre acciones)
+    Access Key — par de claves (ID + secreto) que identifica al usuario IAM en el CLI y APIs
+
+El principio de mínimo privilegio dice: da solo los permisos estrictamente necesarios. Nuestro usuario de GitHub Actions solo necesitará escribir en un bucket específico — nada más.
+
+
+3. El bucket como subdominio propio
+
+Esta sección explica uno de los aspectos más importantes y menos documentados de S3: el nombre del bucket no es arbitrario si quieres acceder a él con tu propio dominio.
+Cómo construye AWS las URLs de un bucket
+
+Cuando creas un bucket, AWS te da automáticamente una URL con este formato:
+
+https://{nombre-del-bucket}.s3.{region}.amazonaws.com/{key}
+
+Ejemplo con un bucket llamado firmwares.denkitronik.com:
+
+https://firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com/esp32/v1.0.0/firmware.bin
+
+Esa URL funciona, pero es larga y no te pertenece. Si mañana migras de AWS, todos tus dispositivos dejan de poder descargar firmwares porque la URL cambia.
+
+La solución profesional: usar tu propio dominio.
+La regla de oro: el nombre del bucket debe ser el subdominio
+
+Si quieres que tus firmwares sean accesibles en:
+
+https://firmwares.tuempresa.com/esp32/v1.0.0/firmware.bin
+
+Entonces el bucket debe llamarse exactamente firmwares.tuempresa.com.
+
+AWS usa el nombre del bucket como parte del enrutamiento HTTP. Cuando un navegador o dispositivo hace una petición a firmwares.tuempresa.com, el servidor DNS la redirige al servidor de AWS, y AWS usa el nombre del host para saber a qué bucket servir el contenido.
+
+Resolucion CNAME a Bucket
+¿Qué es un registro DNS?
+
+El DNS (Domain Name System) es la guía telefónica de Internet. Convierte nombres legibles como firmwares.tuempresa.com en direcciones IP o en otros nombres de servidores.
+
+Los tipos de registro que necesitas conocer:
+
+Tipo
+	
+
+¿Para qué sirve?
+	
+
+Ejemplo
+
+A
+	
+
+Apunta un nombre a una dirección IP
+	
+
+api.empresa.com → 203.0.113.5
+
+CNAME
+	
+
+Apunta un nombre a otro nombre
+	
+
+firmwares.empresa.com → firmwares.empresa.com.s3.amazonaws.com
+
+ALIAS
+	
+
+Como CNAME pero funciona en el dominio raíz
+	
+
+empresa.com → endpoint de AWS
+
+MX
+	
+
+Servidor de correo del dominio
+	
+
+—
+
+TXT
+	
+
+Texto libre (verificación, SPF, etc.)
+	
+
+—
+
+Para conectar tu subdominio con S3 usarás un registro CNAME.
+Paso a paso: conectar tu dominio a S3
+1. Nombra el bucket igual que tu subdominio
+
+Al crear el bucket en el siguiente paso, usa el nombre completo del subdominio:
+
+firmwares.tuempresa.com
+
+Por ejemplo, para denkitronik.com:
+
+firmwares.denkitronik.com
+
+2. Busca el endpoint del bucket en AWS
+
+Después de crear el bucket, en la consola S3:
+
+    Entra al bucket
+    Ve a la pestaña Propiedades
+    En la sección Alojamiento de sitios web estáticos (o en la URL del bucket), verás el endpoint:
+
+firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com
+
+O si activas el website hosting:
+
+firmwares.denkitronik.com.s3-website-sa-east-1.amazonaws.com
+
+3. Crea el registro CNAME en tu registrador de dominio
+
+Ve al panel de administración de tu dominio (GoDaddy, Namecheap, Cloudflare, Google Domains, etc.) y crea el registro:
+
+Campo
+	
+
+Valor
+
+Tipo
+	
+
+CNAME
+
+Nombre / Host
+	
+
+firmwares
+
+Valor / Destino
+	
+
+firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com
+
+TTL
+	
+
+300 (5 minutos, mientras configuras)
+
+Así se vería en distintos paneles:
+
+Cloudflare:
+
+Type    Name        Content                                              TTL
+CNAME   firmwares   firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com  Auto
+
+Namecheap:
+
+Type     Host        Value                                                TTL
+CNAME    firmwares   firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com  300
+
+GoDaddy:
+
+Type     Name        Value                                                TTL
+CNAME    firmwares   firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com  1 hora
+
+4. Verificar que el DNS propagó
+
+Desde la terminal, verifica que el registro CNAME existe:
+
+dig CNAME firmwares.denkitronik.com
+
+Output esperado:
+
+;; ANSWER SECTION:
+firmwares.denkitronik.com. 300 IN CNAME firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com.
+
+También puedes usar nslookup:
+
+nslookup -type=CNAME firmwares.denkitronik.com
+
+Output esperado:
+
+firmwares.denkitronik.com  canonical name = firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com
+
+La propagación DNS puede tardar entre 2 minutos y 48 horas, dependiendo del TTL y los servidores DNS. Con TTL de 300 segundos suele ser rápida.
+¿Y el HTTPS?
+
+Un registro CNAME te da acceso HTTP, pero no HTTPS. Para tener https://firmwares.tuempresa.com necesitas:
+
+    Amazon CloudFront (CDN de AWS) delante del bucket
+    AWS Certificate Manager (ACM) para el certificado SSL gratuito
+
+Ese flujo queda así:
+
+Flujo de descarga de firmware
+
+Esto está fuera del alcance de este codelab (lo veremos en el codelab de CloudFront), pero es importante que sepas que existe y que es el estándar en producción. Aqui te dejo un diagrama mas detallado de esta estrategia si quieres profundizar mas:
+
+Flujo de descarga de firmware detallado
+Resumen visual completo
+
+Registrador de dominio
+
+URL final que verán tus dispositivos:
+
+http://firmwares.tuempresa.com/esp32/latest/firmware.bin
+
+✅ Checkpoint
+
+    [ ] Entiendes por qué el nombre del bucket debe coincidir con el subdominio
+    [ ] Sabes qué es un registro CNAME y para qué sirve
+    [ ] Tienes claro dónde crear el registro DNS (tu registrador de dominio)
+    [ ] Sabes que HTTPS requiere CloudFront + ACM adicionalmente
+
+
+
+4. Crear tu cuenta AWS y configurar IAM
+Paso 1 — Crear la cuenta AWS
+
+Si no tienes cuenta AWS:
+
+    Ve a aws.amazon.com y haz clic en Crear una cuenta de AWS
+    Ingresa tu email, nombre de cuenta y contraseña
+    Selecciona el plan Gratuito (Free Tier)
+    Necesitarás una tarjeta de crédito (no se cobra si te mantienes en la capa gratuita)
+    Verificación por teléfono
+
+Capa gratuita: AWS te da 5 GB de almacenamiento S3, 20,000 peticiones GET y 2,000 peticiones PUT por mes gratis durante 12 meses. Este codelab usa una fracción mínima de eso.
+Paso 2 — Acceder a la consola IAM
+
+Una vez dentro de la consola AWS:
+
+    En la barra de búsqueda superior escribe IAM
+    Haz clic en el servicio IAM
+    En el panel izquierdo selecciona Usuarios
+
+Paso 3 — Crear el usuario IAM para GitHub Actions
+
+Haz clic en Crear usuario y sigue estos pasos:
+
+Nombre del usuario:
+
+github-actions-firmware-uploader
+
+No habilites "Acceso a la consola de administración de AWS". Este usuario solo necesita acceso programático (CLI/API).
+
+Haz clic en Siguiente.
+Paso 4 — Asignar permisos
+
+Selecciona Asociar políticas directamente y haz clic en Crear política.
+
+Se abre una nueva pestaña. Selecciona la pestaña JSON y pega esta política:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SubirFirmwares",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::mi-empresa-firmwares",
+        "arn:aws:s3:::mi-empresa-firmwares/*"
+      ]
+    }
+  ]
+}
+
+Importante: Reemplaza mi-empresa-firmwares con el nombre que le darás a tu bucket en el siguiente paso.
+
+¿Qué significa esta política?
+
+    s3:PutObject — puede subir archivos
+    s3:GetObject — puede descargar archivos
+    s3:ListBucket — puede listar el contenido
+    Solo sobre el bucket especificado — no puede tocar nada más en tu cuenta
+
+Haz clic en Siguiente, ponle el nombre FirmwareUploaderPolicy y haz clic en Crear política.
+
+Vuelve a la pestaña del usuario, refresca la lista de políticas, busca FirmwareUploaderPolicy y selecciónala.
+
+Haz clic en Siguiente y luego Crear usuario.
+Paso 5 — Generar las credenciales (Access Key)
+
+Con el usuario creado:
+
+    Haz clic en el nombre del usuario github-actions-firmware-uploader
+    Ve a la pestaña Credenciales de seguridad
+    En la sección Claves de acceso haz clic en Crear clave de acceso
+    Selecciona el caso de uso: Interfaz de línea de comandos (CLI)
+    Marca la confirmación y haz clic en Siguiente
+    Haz clic en Crear clave de acceso
+
+Verás dos valores. Cópialos ahora — el secreto no se vuelve a mostrar:
+
+ID de clave de acceso:     AKIAIOSFODNN7EXAMPLE
+Clave de acceso secreta:   wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+Guárdalos en un lugar seguro temporalmente. Los usarás en los pasos siguientes.
+✅ Checkpoint
+
+    [ ] Tienes una cuenta AWS activa
+    [ ] Creaste el usuario github-actions-firmware-uploader
+    [ ] Asignaste la política FirmwareUploaderPolicy
+    [ ] Guardaste el Access Key ID y el Secret Access Key
+
+
+5. Crear el Bucket S3
+Reglas para el nombre del bucket
+
+El nombre de tu bucket debe ser:
+
+    Único en todo AWS (a nivel mundial)
+    Entre 3 y 63 caracteres
+    Solo letras minúsculas, números y guiones - y puntos .
+    No puede empezar ni terminar con guión
+
+Como aprendiste en el paso anterior, lo más profesional es que el nombre sea exactamente tu subdominio. Esto permite apuntar tu dominio directo al bucket con un simple registro CNAME:
+
+firmwares.tuempresa.com
+
+Por ejemplo: firmwares.denkitronik.com
+Paso 1 — Abrir el servicio S3
+
+En la consola AWS busca S3 y haz clic en el servicio. Luego haz clic en Crear bucket.
+Paso 2 — Configuración general
+
+Nombre del bucket: usa tu subdominio completo
+
+firmwares.denkitronik.com
+
+Región AWS: Selecciona la más cercana a ti.
+
+    América del Sur → sa-east-1 (São Paulo)
+    América del Norte → us-east-1 (Virginia del Norte)
+    Europa → eu-west-1 (Irlanda)
+
+La región determina dónde físicamente se almacenan tus datos y afecta la latencia de descarga.
+Paso 3 — Configuración de acceso público
+
+Deja marcada la opción Bloquear todo el acceso público.
+
+Nuestros firmwares no son públicos por defecto. Solo el usuario IAM que creamos tiene acceso. Si en el futuro necesitas URLs de descarga pública, puedes generar URLs pre-firmadas (las veremos en los retos adicionales).
+Paso 4 — Habilitar el Versionado
+
+En la sección Versionado de bucket, selecciona Habilitar.
+
+Versionado de bucket
+● Habilitar
+○ Suspender
+
+El versionado es fundamental en un repositorio de firmwares: si un firmware defectuoso sobrescribe uno bueno, puedes recuperar la versión anterior en segundos.
+Paso 5 — Etiquetas (opcional pero recomendado)
+
+Agrega estas etiquetas para organizar costos y recursos:
+
+Clave
+	
+
+Valor
+
+Proyecto
+	
+
+firmware-repo
+
+Equipo
+	
+
+tu-equipo
+
+Ambiente
+	
+
+produccion
+Paso 6 — Crear el bucket
+
+Haz clic en Crear bucket. En 2-3 segundos verás el bucket en la lista.
+✅ Checkpoint
+
+    [ ] El bucket aparece en la consola S3
+    [ ] El nombre sigue las reglas (minúsculas, guiones)
+    [ ] El acceso público está bloqueado
+    [ ] El versionado está habilitado
+
+
+6. Instalar y Configurar el AWS CLI
+
+El AWS CLI (Command Line Interface) te permite interactuar con todos los servicios de AWS desde la terminal. Es la herramienta que GitHub Actions usará internamente para subir tus firmwares.
+Instalación
+
+macOS:
+
+curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
+sudo installer -pkg AWSCLIV2.pkg -target /
+
+Linux (Ubuntu/Debian):
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+Windows:
+
+Descarga el instalador MSI desde:
+
+https://awscli.amazonaws.com/AWSCLIV2.msi
+
+Verificar la instalación
+
+aws --version
+
+Output esperado:
+
+aws-cli/2.x.x Python/3.x.x ...
+
+Configurar las credenciales
+
+Ejecuta el comando de configuración:
+
+aws configure
+
+El CLI te pedirá cuatro valores:
+
+AWS Access Key ID [None]: AKIAIOSFODNN7EXAMPLE
+AWS Secret Access Key [None]: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+Default region name [None]: sa-east-1
+Default output format [None]: json
+
+Estas credenciales se guardan en ~/.aws/credentials y ~/.aws/config.
+
+Seguridad: Nunca pongas estas credenciales directamente en código fuente ni las subas a GitHub. Más adelante las agregaremos como Secrets de GitHub.
+Probar la conexión con tu bucket
+
+Lista el contenido de tu bucket (estará vacío por ahora):
+
+aws s3 ls s3://firmwares.denkitronik.com/
+
+Output esperado (vacío, sin error):
+
+Si ves un error de acceso denegado, revisa que la política IAM tenga el nombre correcto del bucket.
+Subir tu primer firmware de prueba
+
+Crea un archivo de prueba que simule un firmware:
+
+echo "FIRMWARE v0.0.1 TEST" > firmware_test.bin
+
+Súbelo al bucket con la estructura de carpetas que usaremos:
+
+aws s3 cp firmware_test.bin s3://firmwares.denkitronik.com/esp32/v0.0.1/firmware.bin
+
+Output esperado:
+
+upload: ./firmware_test.bin to s3://firmwares.denkitronik.com/esp32/v0.0.1/firmware.bin
+
+Verifica que subió correctamente:
+
+aws s3 ls s3://firmwares.denkitronik.com/esp32/v0.0.1/
+
+Output esperado:
+
+2026-04-16 10:30:00         21 firmware.bin
+
+💡 ¿Qué pasó? El CLI tomó tu archivo local, lo convirtió en un objeto S3 con la key esp32/v0.0.1/firmware.bin y lo almacenó en tu bucket. La / en la key hace que la consola de AWS lo muestre como si estuviera en una carpeta.
+✅ Checkpoint
+
+    [ ] aws --version muestra la versión 2.x
+    [ ] aws configure quedó configurado con tus credenciales
+    [ ] aws s3 ls s3://tu-bucket/ no da error
+    [ ] El archivo de prueba aparece en el bucket
+
+
+	7. Estructura del bucket: nombres reales
+
+El proyecto iot-mqtt-tls usa una convención de nombres plana y directa:
+
+s3://firmwares.denkitronik.com/
+├── firmware_v1.0.0.bin      ← binario de la versión 1.0.0
+├── firmware_v1.1.0.bin      ← binario de la versión 1.1.0
+├── firmware_v1.2.0.bin      ← binario de la versión 1.2.0
+└── firmware_dev-2026-04-16_10-30.bin  ← build de desarrollo (rama main)
+
+El nombre del archivo incluye la versión directamente: firmware_{version}.bin.
+
+Esta simplicidad tiene una ventaja: el mensaje MQTT que el dispositivo recibe incluye la URL completa del binario. El ESP32 no necesita "adivinar" la ruta — la recibe junto con la orden de actualización.
+Versionado semántico
+
+Usa SemVer (Semantic Versioning) con el formato exacto vMAJOR.MINOR.PATCH:
+
+v1.0.0  →  v1.0.1  (corrección de bug en conexión MQTT)
+v1.0.1  →  v1.1.0  (nueva función: portal de configuración WiFi)
+v1.1.0  →  v2.0.0  (cambio de protocolo: MQTT v5)
+
+El workflow detecta automáticamente si es un tag de versión (v1.2.0) o un push a main (genera dev-2026-04-16_10-30) y actúa diferente en cada caso.
+El flujo OTA completo
+
+Lo que hace este sistema va mucho más allá de solo guardar archivos. Es un pipeline OTA (Over-The-Air) completo:
+
+![[flujo-simplificado-actualizacion-ota.png]]
+
+El dispositivo se actualiza solo, sin que nadie lo toque físicamente.
+
+8. Configurar GitHub Actions
+¿Qué es GitHub Actions?
+
+GitHub Actions es el sistema de CI/CD integrado en GitHub. Define workflows (flujos de trabajo) en archivos YAML que se ejecutan automáticamente ante eventos como push, pull requests o creación de tags.
+
+En este proyecto el workflow tiene dos comportamientos según el evento:
+
+Evento
+	
+
+Qué hace
+
+Push a main
+	
+
+Compila el firmware (verifica que el código no está roto)
+
+Push de tag v*.*.*
+	
+
+Compila + sube a S3 + notifica a los dispositivos por MQTT
+Paso 1 — Configurar todos los Secrets
+
+Ve a tu repositorio en GitHub → Settings → Secrets and variables → Actions → New repository secret.
+
+Necesitas crear todos estos secrets:
+
+Grupo 1: AWS S3 (para subir el firmware)
+
+Secret
+	
+
+Valor
+	
+
+Para qué
+
+AWS_ACCESS_KEY_ID
+	
+
+AKIAIOSFODNN7EXAMPLE
+	
+
+Identificar el usuario IAM
+
+AWS_SECRET_ACCESS_KEY
+	
+
+wJalrXUtnFEMI/...
+	
+
+Autenticar el usuario IAM
+
+AWS_REGION
+	
+
+sa-east-1
+	
+
+Región del bucket
+
+S3_BUCKET_NAME
+	
+
+firmwares.denkitronik.com
+	
+
+Nombre del bucket destino
+
+Grupo 2: MQTT (para notificar a los dispositivos)
+
+Secret
+	
+
+Valor
+	
+
+Para qué
+
+MQTT_SERVER
+	
+
+mqtt.tudominio.com
+	
+
+Broker MQTT
+
+MQTT_PORT
+	
+
+8883
+	
+
+Puerto (8883 = TLS)
+
+MQTT_USER
+	
+
+tu-usuario
+	
+
+Usuario del broker (opcional)
+
+MQTT_PASSWORD
+	
+
+tu-password
+	
+
+Contraseña del broker (opcional)
+
+MQTT_TLS
+	
+
+true
+	
+
+Activar TLS en la conexión
+
+Grupo 3: Variables de compilación del firmware
+
+Estos secrets se inyectan como macros de preprocesador durante la compilación de PlatformIO:
+
+Secret
+	
+
+Ejemplo
+	
+
+Para qué
+
+COUNTRY
+	
+
+colombia
+	
+
+Metadato de ubicación
+
+STATE
+	
+
+valle
+	
+
+Metadato de ubicación
+
+CITY
+	
+
+tulua
+	
+
+Metadato de ubicación
+
+WIFI_SSID
+	
+
+MiRedWiFi
+	
+
+WiFi inicial del dispositivo
+
+WIFI_PASSWORD
+	
+
+clave123
+	
+
+Contraseña WiFi inicial
+
+El firmware incluye un portal de aprovisionamiento: si la red WiFi no está disponible, el ESP32 crea su propio punto de acceso para que configures el WiFi desde el navegador. Los valores de WIFI_SSID/PASSWORD son solo un punto de partida.
+Paso 2 — Crear el archivo del workflow
+
+mkdir -p .github/workflows
+
+Paso 3 — El workflow completo y real
+
+Crea .github/workflows/ota-update.yml con este contenido (es el workflow real del proyecto iot-mqtt-tls):
+
+name: OTA Update to ESP32 via MQTT TLS
+
+on:
+  push:
+    branches:
+      - main          # compila en cada push (sin subir a S3)
+    tags:
+      - 'v*.*.*'      # compila + sube a S3 + notifica OTA
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Descargar el código fuente
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      # 2. Python es necesario para PlatformIO y los scripts de build
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      # 3. Instalar PlatformIO (el IDE/CLI para ESP32)
+      - name: Set up PlatformIO
+        run: pip install platformio
+
+      # 4. Detectar si es un tag de versión o un build de desarrollo
+      #    - Tag v1.2.0  → FIRMWARE_VERSION=v1.2.0
+      #    - Push a main → FIRMWARE_VERSION=dev-2026-04-16_10-30
+      - name: Set firmware version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "FIRMWARE_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            DATE=$(date -u +"%Y-%m-%d_%H-%M")
+            echo "FIRMWARE_VERSION=dev-${DATE}" >> $GITHUB_ENV
+          fi
+
+      # 5. Definir el nombre del archivo de salida
+      - name: Set firmware filename
+        run: echo "FIRMWARE_NAME=firmware_${FIRMWARE_VERSION}.bin" >> $GITHUB_ENV
+
+      # 6. Compilar el firmware con PlatformIO
+      #    Los secrets se inyectan como variables de entorno que
+      #    platformio.ini lee con ${sysenv.VARIABLE}
+      - name: Build firmware
+        run: platformio run
+        env:
+          COUNTRY: ${{ secrets.COUNTRY }}
+          STATE: ${{ secrets.STATE }}
+          CITY: ${{ secrets.CITY }}
+          MQTT_SERVER: ${{ secrets.MQTT_SERVER }}
+          MQTT_PORT: ${{ secrets.MQTT_PORT }}
+          MQTT_USER: ${{ secrets.MQTT_USER }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+          WIFI_SSID: ${{ secrets.WIFI_SSID }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+
+      # 7. Subir a S3 (solo cuando es un tag de versión)
+      - name: Upload to S3
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          aws s3 cp .pio/build/esp32dev/firmware.bin \
+            s3://${{ secrets.S3_BUCKET_NAME }}/$FIRMWARE_NAME \
+            --content-type application/octet-stream
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+
+      # 8. Notificar a los dispositivos por MQTT (solo en tags de versión)
+      #    El mensaje JSON indica la versión y la URL de descarga del firmware
+      - name: Publish MQTT OTA message
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          pip install paho-mqtt
+          python3 -c "
+          import os, json, paho.mqtt.publish as publish
+          url = 'https://{bucket}.s3.{region}.amazonaws.com/{firmware}'.format(
+            bucket=os.getenv('S3_BUCKET_NAME'),
+            region=os.getenv('AWS_REGION'),
+            firmware=os.getenv('FIRMWARE_NAME')
+          )
+          payload = json.dumps({
+            'version': os.getenv('FIRMWARE_VERSION'),
+            'url': url
+          })
+          publish.single(
+            topic=os.getenv('DEVICE_TOPIC'),
+            payload=payload,
+            hostname=os.getenv('MQTT_SERVER'),
+            port=int(os.getenv('MQTT_PORT')),
+            auth={'username': os.getenv('MQTT_USER'), 'password': os.getenv('MQTT_PASSWORD')}
+                  if os.getenv('MQTT_USER') else None,
+            tls={} if os.getenv('MQTT_TLS', 'false') == 'true' else None
+          )
+          print('OTA message sent:', payload)
+          "
+        env:
+          DEVICE_TOPIC: dispositivo/device1/ota
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          MQTT_SERVER: ${{ secrets.MQTT_SERVER }}
+          MQTT_PORT: ${{ secrets.MQTT_PORT }}
+          MQTT_USER: ${{ secrets.MQTT_USER }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+          MQTT_TLS: ${{ secrets.MQTT_TLS }}
+
+Desglose del workflow
+
+Cómo PlatformIO recibe los secrets:
+
+platformio.ini define build_flags que leen variables de entorno del sistema:
+
+build_flags =
+    -D MQTT_SERVER=\"${sysenv.MQTT_SERVER}\"
+    -D MQTT_PORT=${sysenv.MQTT_PORT}
+    -D WIFI_SSID=\"${sysenv.WIFI_SSID}\"
+
+Cuando GitHub Actions pone los secrets como variables de entorno en el step de Build firmware, PlatformIO los lee y los inyecta como macros #define en el código C++. El binario compilado ya lleva las credenciales adentro.
+
+El mensaje MQTT que recibe el ESP32:
+
+{
+  "version": "v1.2.0",
+  "url": "https://firmwares.denkitronik.com.s3.sa-east-1.amazonaws.com/firmware_v1.2.0.bin"
+}
+
+El ESP32 (con libota.cpp) está suscrito al tópico dispositivo/device1/ota. Al recibir este JSON, descarga el binario desde la URL y aplica la actualización OTA en un hilo separado sin interrumpir la operación normal.
+
+La condición
+
+if: startsWith(github.ref, 'refs/tags/')
+
+:
+
+Los steps 7 y 8 solo corren cuando el evento es un tag (no en push a main). Esto permite compilar en cada commit para detectar errores, pero solo publicar firmwares oficiales cuando creas explícitamente una versión.
+✅ Checkpoint
+
+    [ ] Creaste los 4 secrets de AWS en GitHub
+    [ ] Creaste los 5 secrets de MQTT en GitHub
+    [ ] Creaste los 5 secrets de variables de compilación
+    [ ] El archivo .github/workflows/ota-update.yml existe en tu repositorio
+    [ ] La indentación usa espacios, no tabs
+
+
+9. Publicar tu primer release OTA
+Paso 1 — Confirmar los archivos en el repositorio
+
+git add .github/workflows/ota-update.yml
+git commit -m "feat: agregar workflow OTA con S3 y MQTT"
+git push origin main
+
+En este momento GitHub Actions correrá solo el build (sin subir a S3). Puedes verlo en la pestaña Actions de tu repositorio. Verifica que el step Build firmware pasa sin errores.
+Paso 2 — Crear el tag de versión para disparar el OTA
+
+git tag v1.0.0
+git push origin v1.0.0
+
+Output esperado de git push:
+
+Total 0 (delta 0), reused 0 (delta 0), pack-reused 0
+To github.com/tu-usuario/iot-mqtt-tls.git
+ * [new tag]         v1.0.0 -> v1.0.0
+
+Paso 3 — Ver el workflow en GitHub Actions
+
+Ve a tu repositorio → pestaña Actions. Verás el workflow ejecutándose:
+
+✅ Checkout repo                 (2s)
+✅ Set up Python                 (8s)
+✅ Set up PlatformIO             (15s)
+✅ Set firmware version          (1s)   → FIRMWARE_VERSION=v1.0.0
+✅ Set firmware filename         (1s)   → FIRMWARE_NAME=firmware_v1.0.0.bin
+✅ Build firmware               (90s)   → .pio/build/esp32dev/firmware.bin
+✅ Upload to S3                  (5s)   → firmware_v1.0.0.bin subido
+✅ Publish MQTT OTA message      (4s)   → OTA message sent: {"version":"v1.0.0","url":"..."}
+
+La compilación con PlatformIO tarda entre 60 y 120 segundos la primera vez porque descarga las librerías. Las siguientes veces es más rápida gracias al cache.
+Paso 4 — Verificar en AWS S3
+
+aws s3 ls s3://firmwares.denkitronik.com/
+
+Output esperado:
+
+2026-04-16 11:00:03    847216 firmware_v1.0.0.bin
+
+Paso 5 — Lo que ve el dispositivo ESP32
+
+En el monitor serial del dispositivo (115200 baudios) verás algo así:
+
+[MQTT] Conectado al broker mqtt.tudominio.com:8883
+[MQTT] Suscrito a: dispositivo/device1/ota
+[OTA]  Mensaje recibido: {"version":"v1.0.0","url":"https://...firmware_v1.0.0.bin"}
+[OTA]  Nueva versión disponible: v1.0.0
+[OTA]  Descargando desde: https://...firmware_v1.0.0.bin
+[OTA]  Progreso: 25%... 50%... 75%... 100%
+[OTA]  Aplicando actualización...
+[OTA]  Reiniciando con firmware v1.0.0
+
+Paso 6 — Publicar una actualización
+
+Para enviar una nueva versión a todos los dispositivos conectados:
+
+# Modifica el código, haz commit
+git add .
+git commit -m "feat: mejorar reconexión WiFi"
+git push origin main
+
+# Cuando el build pase, crea la versión
+git tag v1.1.0
+git push origin v1.1.0
+
+El proceso completo (compilar + subir + notificar) tarda aproximadamente 2 minutos. Todos los dispositivos suscritos al tópico dispositivo/device1/ota se actualizarán automáticamente.
+
+10. Buenas prácticas de seguridad
+
+Un repositorio de firmwares en producción requiere medidas de seguridad adicionales.
+1. Rotación de credenciales
+
+Las Access Keys no deben ser permanentes. Establece una política de rotación:
+
+# Crear nueva clave
+aws iam create-access-key --user-name github-actions-firmware-uploader
+
+# Actualizar los Secrets en GitHub con la nueva clave
+# Luego eliminar la clave anterior
+aws iam delete-access-key \
+  --user-name github-actions-firmware-uploader \
+  --access-key-id AKIAIOSFODNN7EXAMPLE
+
+2. Habilitar MFA Delete en S3
+
+Para prevenir borrados accidentales o maliciosos del bucket:
+
+aws s3api put-bucket-versioning \
+  --bucket firmwares.denkitronik.com \
+  --versioning-configuration Status=Enabled,MFADelete=Enabled \
+  --mfa "arn:aws:iam::ACCOUNT-ID:mfa/root-account-mfa-device TOKEN"
+
+3. Notificaciones de publicación
+
+Agrega una notificación por email o Slack cuando se publique un firmware. Agrega este step al workflow:
+
+      - name: Notificar publicación
+        if: success()
+        run: |
+          echo "📦 Nuevo firmware publicado: ${{ steps.version.outputs.VERSION }}"
+          # Aquí puedes agregar: curl a Slack webhook, email via SES, etc.
+
+4. Firmar los firmwares
+
+En producción, los firmwares deben llevar una firma digital para verificar su autenticidad:
+
+# Generar firma con GPG
+gpg --armor --output firmware.bin.sig --detach-sig firmware.bin
+
+# Subir firma junto al firmware
+aws s3 cp firmware.bin.sig \
+  s3://firmwares.denkitronik.com/esp32-s3/v1.0.0/firmware.bin.sig
+
+5. Lifecycle policies (gestión del ciclo de vida)
+
+Para controlar costos, configura políticas automáticas. En la consola S3, en Administración → Reglas de ciclo de vida:
+
+Regla
+	
+
+Configuración
+
+Mover versiones antiguas a Glacier
+	
+
+Versiones no actuales → Glacier después de 90 días
+
+Eliminar versiones muy antiguas
+	
+
+Versiones no actuales → Eliminar después de 365 días
+6. Auditoría con CloudTrail
+
+Activa AWS CloudTrail para registrar quién descarga qué firmware y cuándo. Esto es obligatorio en contextos regulados (medical devices, automotive, etc.).
+
+
+11. 🎉 ¡Lo lograste!
+
+Construiste un sistema profesional de distribución de firmwares. Cada vez que crees un tag en tu repositorio:
+
+git tag v1.x.x && git push --tags
+
+GitHub Actions compila y sube automáticamente el firmware a AWS S3, versionado y disponible para tus dispositivos.
+¿Qué aprendiste?
+
+    Object Storage: cómo funciona AWS S3 y en qué se diferencia de un sistema de archivos tradicional
+    IAM y seguridad: crear usuarios con mínimos privilegios y gestionar credenciales de forma segura
+    Buckets S3: configurar versionado, acceso y estructura de almacenamiento
+    AWS CLI: comandos aws s3 cp y aws s3 ls para interactuar con S3
+    GitHub Actions: disparar workflows automáticos con git tags
+    SemVer y latest: convenciones para versionar firmwares de forma profesional
+
+🚀 Retos adicionales
+
+Reto 1 — Build real con PlatformIO
+
+Integra un proyecto PlatformIO real. Reemplaza el step de compilación por:
+
+      - name: Instalar PlatformIO
+        run: pip install platformio
+
+      - name: Compilar con PlatformIO
+        run: platformio run --environment esp32-s3
+
+      - name: Preparar binario
+        run: cp .pio/build/esp32-s3/firmware.bin build/firmware.bin
+
+Reto 2 — URL pre-firmada para descarga
+
+Genera una URL temporal (válida por 1 hora) para descargar el firmware sin hacer el bucket público:
+
+aws s3 presign \
+  s3://firmwares.denkitronik.com/esp32-s3/v1.0.0/firmware.bin \
+  --expires-in 3600
+
+Reto 3 — OTA con AWS IoT
+
+Conecta este bucket con AWS IoT Jobs para enviar actualizaciones OTA automáticamente a tus dispositivos en campo.
+Próximos pasos
+
+    Codelab: GitHub Actions avanzado — matrices y ambientes de deployment
+    Codelab: AWS IoT Core — conectar dispositivos ESP32 a la nube
+    Codelab: Terraform — infraestructura como código para tus buckets S3
+
+

@@ -1,0 +1,1477 @@
+1. Introducción
+
+Cuando conectas un sensor de temperatura, una cerradura inteligente o una cámara a internet, esa comunicación viaja por la red. Si no la proteges, cualquier persona en la misma red puede leer los datos, suplantar a tus dispositivos, o enviarles comandos maliciosos.
+
+En este codelab vas a construir desde cero un broker MQTT de producción que:
+
+    Cifra toda comunicación con TLS (el mismo estándar que usa HTTPS).
+    Obtiene un certificado gratis y válido de Let's Encrypt de forma automática.
+    Controla quién puede publicar y suscribirse a cada topic con reglas ACL.
+    Corre en cualquier VPS o instancia de nube con solo dos comandos.
+
+Qué vas a aprender
+
+    Qué es MQTT y por qué es el protocolo estándar de IoT.
+    Qué es un broker, un topic y cómo fluye un mensaje MQTT.
+    Qué es TLS y por qué un certificado de Let's Encrypt es suficiente para producción.
+    Cómo funciona la ACL (Access Control List) en EMQX con variables de usuario.
+    Cómo abrir los puertos necesarios en Linux, AWS, GCP y Azure.
+    Cómo probar la conexión segura desde otro computador con mosquitto_sub y mosquitto_pub.
+
+El escenario
+
+Imagina que trabajas en una startup de ciudades inteligentes. Tienes sensores distribuidos en varios edificios que reportan temperatura, humedad y consumo eléctrico. Necesitas:
+
+    Que cada sensor solo pueda publicar en su propio canal (no en el de otro).
+    Que un servidor backend pueda leer los datos de todos los sensores.
+    Que todo viaje cifrado para proteger la privacidad de los datos.
+
+Ese es exactamente el problema que vas a resolver.
+
+
+2. Conceptos clave
+
+Antes de tocar el teclado, necesitas entender tres conceptos: MQTT, TLS y ACL.
+Qué es MQTT
+
+MQTT (Message Queuing Telemetry Transport) es un protocolo de mensajería diseñado para dispositivos con recursos limitados: microcontroladores, sensores, módulos WiFi de bajo costo.
+
+Su filosofía es simple: publicar y suscribirse a topics a través de un intermediario central llamado broker.
+
+[Sensor A]  ──publica──▶  [Broker]  ──reenvía──▶  [Backend / App]
+[Sensor B]  ──publica──▶  [Broker]
+
+El sensor no sabe quién va a leer su mensaje. Solo lo publica en un topic y el broker lo distribuye a todos los suscriptores. Esto se llama patrón pub/sub.
+Qué es un topic
+
+Un topic en MQTT es como una dirección de correo, pero jerárquica, separada por barras. Ejemplos:
+
+bogota/edificio5/piso3/sensor_01/temperatura
+bogota/edificio5/piso3/sensor_01/humedad
+bogota/edificio5/piso3/sensor_01/out
+
+Los topics son texto libre. No necesitas registrarlos en ningún lado. El broker los crea automáticamente cuando alguien publica por primera vez.
+Wildcards de topic
+
+MQTT tiene dos comodines para suscribirse a múltiples topics a la vez:
+
+Comodín
+	
+
+Nombre
+	
+
+Uso
+
++
+	
+
+Single-level
+	
+
+Reemplaza exactamente UN nivel
+
+#
+	
+
+Multi-level
+	
+
+Reemplaza todo lo que sigue (solo al final)
+
+Ejemplos:
+
+bogota/+/piso3/+/out     → todo lo de piso3 en cualquier edificio
+bogota/#                 → absolutamente todo en bogota
+
+Qué es QoS
+
+Quality of Service define la garantía de entrega de un mensaje:
+
+QoS
+	
+
+Garantía
+
+0
+	
+
+Fire and forget — sin confirmación
+
+1
+	
+
+Al menos una vez — puede duplicarse
+
+2
+	
+
+Exactamente una vez — más lento pero confiable
+
+Para sensores que publican cada 5 segundos, QoS 0 es suficiente. Para comandos críticos (abrir una puerta), usa QoS 1 o 2.
+Qué es TLS y por qué importa
+
+Imagina que envías una carta en un sobre transparente. Cualquiera en el camino puede leerla. TLS es como meter esa carta en una caja de seguridad: solo quien tiene la llave correcta puede abrirla.
+
+TLS funciona con certificados digitales. Un certificado le dice al cliente: "Soy realmente mqtt.tudominio.com, y una autoridad confiable lo certifica."
+
+Let's Encrypt es una autoridad de certificación gratuita y automática. Emite certificados válidos en segundos. Los certificados duran 90 días y se pueden renovar automáticamente.
+
+Un certificado de Let's Encrypt es idéntico en seguridad al que compran los bancos. La diferencia es que ellos pagan por soporte y validación extendida (EV). Para IoT, Let's Encrypt es más que suficiente.
+Qué es una ACL
+
+ACL (Access Control List) es una lista de reglas que define quién puede hacer qué en el broker.
+
+Sin ACL, cualquier cliente que se conecte con usuario y contraseña válidos puede publicar en cualquier topic. Eso es inaceptable en producción.
+
+Con ACL puedes decir cosas como:
+
+    "El sensor_01 solo puede publicar en su propio canal."
+    "El backend puede leer de todos los canales."
+    "Nadie puede acceder a los topics internos del sistema."
+
+Las reglas se evalúan de arriba a abajo. La primera que coincide gana.
+El flujo completo
+
+[Sensor IoT]
+    │
+    │ MQTT sobre TLS (puerto 8883)
+    │ Usuario: sensor_01 / Contraseña: ****
+    ▼
+[EMQX Broker]
+    │
+    ├─ ¿TLS válido? ✅
+    ├─ ¿Credenciales correctas? ✅
+    ├─ ¿ACL permite publicar en este topic? ✅
+    │
+    ▼
+[Backend / App] ← suscrito al mismo broker
+
+
+3. Prerequisitos
+
+Antes de empezar necesitas tener listo lo siguiente:
+1. Una VPS o instancia de nube
+
+Necesitas un servidor Linux accesible desde internet. Puede ser:
+
+    Una instancia EC2 en AWS (t2.micro gratis el primer año)
+    Una VM en GCP (e2-micro siempre gratis)
+    Una VM en Azure (B1s con créditos gratuitos)
+    Cualquier VPS de DigitalOcean, Hetzner, Linode, etc.
+
+El servidor debe tener al menos:
+
+    1 vCPU, 1 GB RAM
+    Ubuntu 22.04 LTS (recomendado)
+    IP pública fija
+
+2. Un dominio apuntando a tu servidor
+
+Let's Encrypt necesita verificar que controlas el dominio. Para eso, el dominio debe resolver a la IP de tu servidor.
+
+Si no tienes un dominio, puedes usar uno gratuito en:
+
+    freedns.afraid.org — regístrate y crea un subdominio gratis
+    No-IP — similar
+
+Para verificar que tu dominio resuelve correctamente:
+
+nslookup mqtt.tudominio.com
+
+Debe mostrar la IP de tu servidor.
+3. Docker y Docker Compose en el servidor
+
+Conéctate a tu servidor por SSH e instala Docker:
+
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+
+Cierra y vuelve a abrir la sesión SSH para que el grupo surta efecto. Verifica:
+
+docker --version
+docker compose version
+
+Docker Compose v2 viene incluido con Docker Engine moderno. El comando es `docker compose` (sin guión), no `docker-compose`.
+4. mosquitto-clients en tu computador local (para pruebas)
+
+En Ubuntu/Debian:
+
+sudo apt install mosquitto-clients
+
+En macOS:
+
+brew install mosquitto
+
+En Windows: descarga el instalador de mosquitto.org e instala solo las herramientas cliente.
+Checkpoint ✅
+
+    [ ] Tengo un servidor Linux con IP pública y acceso SSH.
+    [ ] El dominio mqtt.tudominio.com resuelve a la IP del servidor (nslookup lo confirma).
+    [ ] Docker y Docker Compose están instalados en el servidor.
+    [ ] mosquitto_sub y mosquitto_pub están disponibles en mi computador local.
+
+
+4. Abre los puertos necesarios
+
+El broker necesita dos puertos accesibles desde internet:
+
+Puerto
+	
+
+Protocolo
+	
+
+Uso
+
+80
+	
+
+TCP
+	
+
+Let's Encrypt lo usa para verificar el dominio (HTTP challenge)
+
+8883
+	
+
+TCP
+	
+
+MQTT sobre TLS — los dispositivos IoT se conectan aquí
+
+El puerto 80 solo se necesita la primera vez que emites el certificado y cada vez que se renueva (cada 90 días). No necesitas mantenerlo abierto permanentemente.
+Configuración en Linux con iptables
+
+Conéctate al servidor por SSH y ejecuta:
+
+# Abrir puerto 80 (Let's Encrypt)
+sudo iptables -I INPUT 1 -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+
+# Abrir puerto 8883 (MQTT sobre TLS)
+sudo iptables -I INPUT 1 -p tcp --dport 8883 -m conntrack --ctstate NEW -j ACCEPT
+
+Para verificar que las reglas quedaron activas:
+
+sudo iptables -L INPUT --line-numbers
+
+Debes ver las reglas en las primeras posiciones de la cadena INPUT.
+
+En muchas distribuciones modernas (Ubuntu 22.04+) el firewall por defecto es `ufw`. Si `ufw` está activo, usa `sudo ufw allow 80/tcp` y `sudo ufw allow 8883/tcp` en lugar de iptables.
+Configuración en AWS (Security Groups)
+
+En AWS el firewall se llama Security Group. Está separado del firewall del sistema operativo — debes abrirlo en ambos lugares.
+
+    Ve a la consola de AWS → EC2 → selecciona tu instancia.
+    En la pestaña inferior, haz clic en el Security Group asignado.
+    Haz clic en Edit inbound rules.
+    Agrega las siguientes reglas:
+
+Tipo
+	
+
+Protocolo
+	
+
+Puerto
+	
+
+Origen
+
+Custom TCP
+	
+
+TCP
+	
+
+80
+	
+
+0.0.0.0/0
+
+Custom TCP
+	
+
+TCP
+	
+
+8883
+	
+
+0.0.0.0/0
+
+    Haz clic en Save rules.
+
+El origen 0.0.0.0/0 significa "cualquier IP". Para mayor seguridad, puedes restringir el 8883 a las IPs de tus dispositivos, pero para este laboratorio lo dejamos abierto.
+Configuración en GCP (Firewall Rules)
+
+En GCP el firewall se configura a nivel de red VPC.
+
+    Ve a la consola de GCP → VPC network → Firewall.
+    Haz clic en Create firewall rule.
+    Crea la primera regla para el puerto 80:
+
+Campo
+	
+
+Valor
+
+Name
+	
+
+allow-http-certbot
+
+Direction
+	
+
+Ingress
+
+Action
+	
+
+Allow
+
+Targets
+	
+
+All instances in the network
+
+Source IP ranges
+	
+
+0.0.0.0/0
+
+Protocols and ports
+	
+
+TCP: 80
+
+    Crea una segunda regla idéntica pero con nombre allow-mqtt-tls y puerto 8883.
+
+En GCP también puedes usar `gcloud` desde la terminal: `gcloud compute firewall-rules create allow-mqtt-tls --allow tcp:8883 --source-ranges 0.0.0.0/0`
+Configuración en Azure (Network Security Group)
+
+En Azure el firewall se llama Network Security Group (NSG).
+
+    Ve al portal de Azure → busca tu máquina virtual.
+    En el menú izquierdo, haz clic en Networking.
+    Haz clic en Add inbound port rule (botón azul).
+    Crea la regla para el puerto 8883:
+
+Campo
+	
+
+Valor
+
+Source
+	
+
+Any
+
+Source port ranges
+	
+
+*
+
+Destination
+	
+
+Any
+
+Service
+	
+
+Custom
+
+Destination port ranges
+	
+
+8883
+
+Protocol
+	
+
+TCP
+
+Action
+	
+
+Allow
+
+Priority
+	
+
+310
+
+Name
+	
+
+Allow-MQTT-TLS
+
+    Repite el proceso para el puerto 80 con prioridad 300 y nombre Allow-HTTP-Certbot.
+
+Verifica la conectividad
+
+Desde tu computador local, verifica que los puertos están abiertos:
+
+# Verifica que el puerto 8883 responde
+nc -zv mqtt.tudominio.com 8883
+
+Si la respuesta es Connection to mqtt.tudominio.com port 8883 [tcp] succeeded, los puertos están correctamente abiertos.
+Checkpoint ✅
+
+    [ ] El firewall de Linux (iptables/ufw) tiene abiertos los puertos 80 y 8883.
+    [ ] Si uso un proveedor de nube, el Security Group / Firewall Rule también tiene esos puertos abiertos.
+    [ ] nc -zv mqtt.tudominio.com 8883 devuelve "succeeded" desde mi computador.
+
+
+5. Estructura del proyecto
+
+Vamos a organizar los archivos del proyecto de forma limpia. Conéctate al servidor por SSH y crea la estructura:
+
+mkdir -p ~/mqtt-project
+cd ~/mqtt-project
+
+La estructura final del proyecto será:
+
+mqtt-project/
+├── compose.yaml      ← orquesta certbot + emqx
+├── .env              ← variables de entorno (secretos)
+├── acl.conf          ← reglas de control de acceso
+├── certs/            ← certificados Let's Encrypt (generado por certbot)
+└── emqx-certs/       ← solo los dos .pem que EMQX necesita (generado automático)
+
+El archivo `.env` contiene contraseñas. Nunca lo subas a un repositorio público. Agrega `.env` a tu `.gitignore`.
+El archivo .env
+
+Crea el archivo de variables de entorno:
+
+nano ~/mqtt-project/.env
+
+Copia este contenido y reemplaza los valores con los tuyos:
+
+# Dominio que apunta a este servidor
+DOMAIN=mqtt.tudominio.com
+
+# Email para notificaciones de Let's Encrypt (renovación, expiración)
+EMAIL=tu@email.com
+
+# Credenciales del dashboard de EMQX
+EMQX_ADMIN_USER=admin
+EMQX_ADMIN_PASS=CambiaMePorAlgoSeguro123!
+
+# Cookie interna de Erlang (cadena aleatoria larga)
+EMQX_COOKIE=cambia-esta-cadena-por-algo-muy-largo-y-aleatorio
+
+Para generar un cookie seguro puedes usar:
+
+openssl rand -hex 32
+
+Por qué usamos variables de entorno
+
+Hardcodear contraseñas en el compose.yaml es un error común. Si compartes el archivo, compartes las contraseñas. Las variables de entorno separan la configuración (que puedes compartir) de los secretos (que nunca debes compartir).
+
+Docker Compose lee automáticamente el archivo .env que está en la misma carpeta del compose.
+Checkpoint ✅
+
+    [ ] Creé la carpeta ~/mqtt-project.
+    [ ] Creé el archivo .env con mi dominio, email y contraseñas propias.
+    [ ] Generé un cookie aleatorio con openssl rand -hex 32.
+
+
+Un certificado TLS es un archivo que prueba que eres el dueño del dominio y contiene la clave pública para cifrar la comunicación. Let's Encrypt te lo da gratis en segundos, pero necesita verificar que realmente controlas el dominio.
+Cómo funciona el HTTP Challenge
+
+Let's Encrypt usa un mecanismo llamado HTTP-01 challenge:
+
+1. Tu servidor le dice a Let's Encrypt: "Quiero un certificado para mqtt.tudominio.com"
+2. Let's Encrypt responde: "OK, pon este archivo secreto en http://mqtt.tudominio.com/.well-known/..."
+3. certbot crea ese archivo y levanta un servidor web temporal en el puerto 80
+4. Let's Encrypt visita esa URL, verifica el archivo
+5. Si coincide: emite el certificado ✅
+6. certbot guarda los archivos .pem en /etc/letsencrypt/live/tudominio/
+
+Por eso necesitas el puerto 80 abierto solo durante la emisión/renovación del certificado.
+Los archivos del certificado
+
+Let's Encrypt genera cuatro archivos. Los que nos importan son:
+
+Archivo
+	
+
+Contenido
+	
+
+Para qué sirve
+
+fullchain.pem
+	
+
+Certificado + cadena intermedia
+	
+
+Se envía al cliente para que lo verifique
+
+privkey.pem
+	
+
+Clave privada del servidor
+	
+
+Descifra la comunicación (¡nunca compartir!)
+
+EMQX necesita exactamente esos dos archivos.
+El problema de los symlinks
+
+Let's Encrypt guarda los certificados en /etc/letsencrypt/archive/tudominio/ y crea enlaces simbólicos (symlinks) en /etc/letsencrypt/live/tudominio/. Los symlinks apuntan a la versión más reciente.
+
+El problema: cuando copiamos el volumen entre contenedores, los symlinks no se resuelven automáticamente. Por eso el script de certbot usa cp -L (copy resolving symlinks) para copiar los archivos reales, no los enlaces.
+La sección certbot del compose
+
+certbot:
+  image: certbot/certbot
+  container_name: certbot_tls
+  volumes:
+    - ./certs:/etc/letsencrypt       # ← Let's Encrypt guarda aquí los certificados
+    - ./emqx-certs:/certs            # ← EMQX leerá de aquí (solo los .pem resueltos)
+  ports:
+    - "80:80"                        # ← necesario para el HTTP challenge
+  entrypoint: >
+    sh -c "
+      DOMAIN=$DOMAIN
+      EMAIL=$EMAIL
+      if [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
+        echo '✅ Certificado ya existe. No se emitirá uno nuevo.';
+      elif [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ]; then
+        echo '⚠️  Certificado ya fue solicitado recientemente.';
+      else
+        certbot certonly --standalone --agree-tos --no-eff-email \
+          --non-interactive --preferred-challenges http \
+          --domains $DOMAIN --email $EMAIL \
+          --deploy-hook 'chmod -R 644 /etc/letsencrypt/live /etc/letsencrypt/archive && chown -R 1883:1883 /etc/letsencrypt';
+      fi
+      echo '📄 Copiando .pem a /certs (resolviendo symlinks)';
+      mkdir -p /certs;
+      cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem /certs/fullchain.pem;
+      cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem   /certs/privkey.pem;
+      chown root:1000 /certs/fullchain.pem /certs/privkey.pem;
+      chmod 644 /certs/fullchain.pem;
+      chmod 640 /certs/privkey.pem;
+      echo '✅ Certs listos en ./emqx-certs del host';"
+  environment:
+    - DOMAIN=${DOMAIN}
+    - EMAIL=${EMAIL}
+  networks:
+    - mqtt_net
+
+Línea por línea: qué hace el script
+
+El if/elif/else protege contra errores comunes:
+
+    Si el certificado ya existe → no pide uno nuevo (Let's Encrypt tiene límite de 5 por semana por dominio).
+    Si hay un archivo de renovación → el certificado fue solicitado recientemente, espera.
+    Si no existe → lo pide por primera vez.
+
+El --deploy-hook se ejecuta después de emitir exitosamente: ajusta permisos para que EMQX (que corre como usuario 1883) pueda leer los archivos.
+
+El bloque final siempre copia los .pem resueltos a /certs con los permisos correctos:
+
+    fullchain.pem: modo 644 (todos pueden leer, solo root puede escribir)
+    privkey.pem: modo 640 (solo root y grupo 1000 pueden leer — EMQX corre con GID 1000)
+
+El contenedor certbot se ejecuta y termina. No queda corriendo. Si necesitas renovar el certificado en el futuro, simplemente vuelve a ejecutar `docker compose up certbot`.
+
+
+7. El servicio EMQX: el broker MQTT
+
+EMQX es uno de los brokers MQTT más usados en producción. La versión 5 soporta:
+
+    Millones de conexiones concurrentes
+    Clustering multinodo
+    Dashboard web para monitoreo
+    ACL con variables de usuario
+    Plugins para autenticación con bases de datos
+
+Para nuestro caso, la configuración por variables de entorno es suficiente.
+La sección emqx del compose
+
+emqx:
+  image: emqx/emqx:5.6
+  container_name: emqx_tls
+  depends_on:
+    - certbot                        # ← espera que certbot termine primero
+  restart: unless-stopped            # ← se reinicia automáticamente si falla
+  environment:
+    # Credenciales del Dashboard web (puerto 18083)
+    EMQX_DASHBOARD__DEFAULT_USERNAME: "${EMQX_ADMIN_USER}"
+    EMQX_DASHBOARD__DEFAULT_PASSWORD: "${EMQX_ADMIN_PASS}"
+    EMQX_NODE__COOKIE: "${EMQX_COOKIE}"
+
+    # Activar el listener TLS en el puerto 8883
+    EMQX_LISTENERS__SSL__DEFAULT__ENABLE: "true"
+    EMQX_LISTENERS__SSL__DEFAULT__BIND: "0.0.0.0:8883"
+
+    # Rutas a los certificados (dentro del contenedor)
+    EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: "/certs/fullchain.pem"
+    EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE:  "/certs/privkey.pem"
+
+  volumes:
+    - ./emqx-certs:/certs:ro         # ← montado en solo lectura (ro)
+    - emqx_data:/opt/emqx/data       # ← datos persistentes (usuarios, reglas)
+    - emqx_log:/opt/emqx/log         # ← logs
+  ports:
+    - "8883:8883"                    # ← MQTT sobre TLS (principal)
+    - "18083:18083"                  # ← Dashboard web
+  networks:
+    - mqtt_net
+
+Por qué depends_on es importante aquí
+
+depends_on: certbot le dice a Docker Compose que inicie el contenedor certbot antes que EMQX. Esto garantiza que cuando EMQX arranque, los archivos .pem ya existan en ./emqx-certs.
+
+Sin esta dependencia, EMQX podría intentar leer los certificados antes de que certbot los haya copiado, y fallaría con un error de "archivo no encontrado".
+El formato de las variables de entorno de EMQX
+
+EMQX usa doble guión bajo (__) como separador de jerarquía en sus variables de entorno. Esto corresponde a su configuración interna:
+
+EMQX_LISTENERS__SSL__DEFAULT__BIND
+      ↓        ↓    ↓       ↓
+  listeners.ssl.default.bind = "0.0.0.0:8883"
+
+Es una convención de EMQX para sobreescribir cualquier parámetro de su archivo de configuración sin necesidad de montar archivos adicionales.
+El volumen emqx-certs montado como solo lectura
+
+El volumen ./emqx-certs:/certs:ro monta la carpeta de certificados en modo solo lectura dentro del contenedor EMQX. Esto es una buena práctica de seguridad: el broker necesita leer los certificados pero nunca debería modificarlos.
+El Dashboard de EMQX
+
+EMQX incluye un dashboard web en el puerto 18083. Puedes acceder a él en:
+
+http://mqtt.tudominio.com:18083
+
+Desde el dashboard puedes crear usuarios MQTT, ver conexiones activas, monitorear topics y gestionar las reglas ACL de forma visual. Es una herramienta muy útil para depuración.
+
+
+8. Control de acceso con ACL
+
+La ACL es el mecanismo que controla qué puede hacer cada cliente MQTT. Sin ella, un sensor malicioso podría publicar en el topic de otro sensor, inyectar datos falsos, o leer información que no le corresponde.
+Cómo funciona la evaluación de reglas
+
+EMQX evalúa las reglas de arriba a abajo. La primera regla que coincide con la solicitud es la que se aplica. Si ninguna regla coincide, se aplica la regla por defecto (en nuestro caso, denegar todo).
+
+Cliente solicita: PUBLISH a "bogota/ed5/p3/sensor_01/out"
+
+Regla 1: ¿coincide?  NO → siguiente
+Regla 2: ¿coincide?  NO → siguiente
+Regla 3: ¿coincide?  SÍ → PERMITIR ✅ (se detiene aquí)
+
+El formato de una regla ACL
+
+EMQX usa sintaxis Erlang para las reglas ACL:
+
+{accion, quien, operacion, [topics]}.
+
+Donde:
+
+    accion es allow o deny
+    quien puede ser all, {username, "nombre"}, {ipaddr, "ip"}
+    operacion puede ser all, publish, subscribe
+    topics es una lista de topics, con comodines
+
+Cada regla debe terminar con un punto (`.`). Es sintaxis Erlang, no olvides el punto final.
+La variable de usuario ${username}
+
+EMQX soporta una variable especial en los topics de las reglas ACL:
+
+${username}
+
+Esta variable se reemplaza automáticamente por el nombre de usuario del cliente que está intentando la operación. Es la clave para dar a cada dispositivo acceso solo a su propio canal.
+La estructura de topics de nuestro proyecto
+
+Nuestros topics siguen esta jerarquía de 6 niveles:
+
+pais / ciudad / edificio / piso / dispositivo / direccion
+  +  /   +    /    +     /  +  / ${username} /  in|out
+
+Ejemplo real:
+
+co/bogota/edificio5/piso3/sensor_01/out   ← sensor publica datos aquí
+co/bogota/edificio5/piso3/sensor_01/in    ← backend envía comandos aquí
+
+El nivel 5 es el nombre de usuario del dispositivo. Así, cada sensor queda aislado en su propio espacio de topics.
+El archivo acl.conf completo
+
+Crea el archivo en el servidor:
+
+nano ~/mqtt-project/acl.conf
+
+Contenido:
+
+%% ============================================================
+%% ACL para broker MQTT IoT
+%% Evaluación: de arriba a abajo, primera coincidencia gana
+%% ============================================================
+
+%% --- Permisos especiales del sistema ---
+
+%% El usuario "dashboard" puede leer métricas internas de EMQX
+{allow, {username, "dashboard"}, subscribe, ["$SYS/#"]}.
+
+%% Desde localhost se permite todo (útil para debugging y bridges locales)
+{allow, {ipaddr, "127.0.0.1"}, all, ["$SYS/#", "#"]}.
+
+
+%% --- Reglas generales por patrón de username ---
+
+%% Cualquier usuario puede SUSCRIBIRSE a su propio canal de entrada
+%% (para recibir comandos desde el backend)
+{allow, all, subscribe, ["+/+/+/+/${username}/in"]}.
+
+%% Cualquier usuario puede PUBLICAR y SUSCRIBIRSE a su propio canal de salida
+%% (para enviar datos del sensor y leer confirmaciones)
+{allow, all, publish,   ["+/+/+/+/${username}/out"]}.
+{allow, all, subscribe, ["+/+/+/+/${username}/out"]}.
+
+
+%% --- Roles administrativos ---
+
+%% admin: acceso total a todos los topics
+{allow, {username, "admin"}, all, ["#"]}.
+
+%% admin2: puede ESCRIBIR en cualquier canal /in y LEER cualquier canal /out
+%% (perfil típico de un backend que envía comandos y lee respuestas)
+{allow, {username, "admin2"}, publish,   ["+/+/+/+/${username}/in"]}.
+{allow, {username, "admin2"}, subscribe, ["+/+/+/+/${username}/out"]}.
+
+
+%% --- Bloqueos de seguridad ---
+
+%% Nadie puede suscribirse a los topics internos del sistema ni al comodín raíz
+%% (evita que clientes espíen el estado interno del broker)
+{deny, all, subscribe, ["$SYS/#", {eq, "#"}]}.
+
+
+%% --- Regla por defecto: denegar todo lo que no coincidió arriba ---
+{deny, all}.
+
+Análisis regla por regla
+
+Regla 1 — dashboard puede leer $SYS/#
+
+{allow, {username, "dashboard"}, subscribe, ["$SYS/#"]}.
+
+Los topics $SYS/ son internos de EMQX: estadísticas, número de conexiones, mensajes por segundo. El usuario especial dashboard puede leerlos para monitoreo, pero ningún otro usuario puede hacerlo (bloqueado más abajo).
+
+Regla 2 — localhost tiene acceso total
+
+{allow, {ipaddr, "127.0.0.1"}, all, ["$SYS/#", "#"]}.
+
+Útil para scripts de administración que corren en el mismo servidor o para bridges MQTT locales. Solo aplica a conexiones que llegan desde el propio servidor.
+
+Reglas 3 y 4 — patrón ${username}
+
+{allow, all, subscribe, ["+/+/+/+/${username}/in"]}.
+{allow, all, publish,   ["+/+/+/+/${username}/out"]}.
+{allow, all, subscribe, ["+/+/+/+/${username}/out"]}.
+
+Estas son las reglas más importantes. El + coincide con cualquier valor en ese nivel. El ${username} se reemplaza dinámicamente.
+
+Si el usuario es sensor_01 conectado con ese username:
+
+    Puede suscribirse a cualquier/cosa/aqui/tambien/sensor_01/in
+    Puede publicar en cualquier/cosa/aqui/tambien/sensor_01/out
+    No puede publicar en cualquier/cosa/aqui/tambien/sensor_02/out
+
+Regla admin2 — perfil backend
+
+{allow, {username, "admin2"}, publish,   ["+/+/+/+/${username}/in"]}.
+{allow, {username, "admin2"}, subscribe, ["+/+/+/+/${username}/out"]}.
+
+Aquí ${username} se reemplaza por admin2. Entonces admin2 puede publicar en +/+/+/+/admin2/in y leer de +/+/+/+/admin2/out. Pero hay un patrón de diseño más útil: si el backend usa el username como prefijo del topic del dispositivo, puede hablar con cualquier dispositivo.
+
+Un patrón de diseño común para el backend es usar un usuario con acceso total (`admin`) o combinar la ACL con autenticación por base de datos donde el backend tiene permiso sobre todos los topics de su organización.
+
+Bloqueo de $SYS y comodín raíz
+
+{deny, all, subscribe, ["$SYS/#", {eq, "#"}]}.
+
+El {eq, "#"} es especial: coincide exactamente con el string "#" como topic, no como comodín. Impide que alguien se suscriba a # para espiar absolutamente todos los mensajes del broker.
+
+Regla final: denegar todo
+
+{deny, all}.
+
+Sin esta regla, EMQX permitiría por defecto cualquier acción que no haya coincidido con ninguna regla anterior. Esta regla cierra ese hueco de seguridad.
+Montar el archivo ACL en EMQX
+
+Para que EMQX cargue el archivo ACL, debes montarlo en el contenedor y configurar la variable de entorno correspondiente. Agrega esto al servicio emqx en el compose:
+
+volumes:
+  - ./acl.conf:/opt/emqx/etc/acl.conf:ro
+
+Y la variable de entorno:
+
+environment:
+  EMQX_AUTHORIZATION__SOURCES: >
+    [{type: file, enable: true, path: "/opt/emqx/etc/acl.conf"}]
+
+Checkpoint ✅
+
+    [ ] Entiendo que la ACL se evalúa de arriba a abajo.
+    [ ] Entiendo qué hace ${username} en un topic de ACL.
+    [ ] Puedo explicar por qué un sensor con username sensor_01 no puede publicar en el topic de sensor_02.
+    [ ] Creé el archivo acl.conf en ~/mqtt-project/.
+
+9. El compose.yaml completo
+
+Ahora junta todo en el archivo compose.yaml. Crea el archivo en el servidor:
+
+nano ~/mqtt-project/compose.yaml
+
+Contenido completo:
+
+services:
+  certbot:
+    image: certbot/certbot
+    container_name: certbot_tls
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./emqx-certs:/certs
+    ports:
+      - "80:80"
+    entrypoint: >
+      sh -c "
+        DOMAIN=$DOMAIN
+        EMAIL=$EMAIL
+        if [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
+          echo '✅ Certificado ya existe. No se emitirá uno nuevo.';
+        elif [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ]; then
+          echo '⚠️  Certificado ya fue solicitado recientemente. Esperando renovación automática.';
+        else
+          certbot certonly --standalone --agree-tos --no-eff-email --non-interactive --preferred-challenges http --domains $DOMAIN --email $EMAIL \
+            --deploy-hook 'chmod -R 644 /etc/letsencrypt/live /etc/letsencrypt/archive && chown -R 1883:1883 /etc/letsencrypt';
+        fi
+        echo '📄 Copiando .pem a /certs (resolviendo symlinks)';
+        mkdir -p /certs;
+        cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem /certs/fullchain.pem;
+        cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem   /certs/privkey.pem;
+        chown root:1000 /certs/fullchain.pem /certs/privkey.pem;
+        chmod 644 /certs/fullchain.pem;
+        chmod 640 /certs/privkey.pem;
+        echo '✅ Certs listos en ./emqx-certs del host';"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - EMAIL=${EMAIL}
+    networks:
+      - mqtt_net
+
+  emqx:
+    image: emqx/emqx:5.6
+    container_name: emqx_tls
+    depends_on:
+      - certbot
+    restart: unless-stopped
+    environment:
+      # Credenciales del Dashboard
+      EMQX_DASHBOARD__DEFAULT_USERNAME: "${EMQX_ADMIN_USER}"
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: "${EMQX_ADMIN_PASS}"
+      EMQX_NODE__COOKIE: "${EMQX_COOKIE}"
+
+      # Listener TLS en 8883
+      EMQX_LISTENERS__SSL__DEFAULT__ENABLE: "true"
+      EMQX_LISTENERS__SSL__DEFAULT__BIND: "0.0.0.0:8883"
+
+      # Certificados Let's Encrypt
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: "/certs/fullchain.pem"
+      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE:  "/certs/privkey.pem"
+
+      # ACL: usar el archivo montado
+      EMQX_AUTHORIZATION__SOURCES: >
+        [{type: file, enable: true, path: "/opt/emqx/etc/acl.conf"}]
+
+    volumes:
+      - ./emqx-certs:/certs:ro
+      - ./acl.conf:/opt/emqx/etc/acl.conf:ro
+      - emqx_data:/opt/emqx/data
+      - emqx_log:/opt/emqx/log
+    ports:
+      - "8883:8883"     # MQTT sobre TLS
+      - "18083:18083"   # Dashboard
+    networks:
+      - mqtt_net
+
+networks:
+  mqtt_net:
+    driver: bridge
+
+volumes:
+  emqx_data:
+  emqx_log:
+
+10. Levanta el stack y verifica
+
+Ya tienes todos los archivos listos. Es hora de levantar el stack.
+Verifica la estructura de archivos
+
+ls -la ~/mqtt-project/
+
+Debes ver:
+
+compose.yaml
+.env
+acl.conf
+
+Levanta el stack
+
+cd ~/mqtt-project
+docker compose up
+
+La primera vez usa `up` sin `-d` para ver los logs en tiempo real y detectar errores. Una vez que todo funcione, puedes usar `docker compose up -d` para correr en background.
+
+Verás el proceso en dos etapas:
+
+Etapa 1 — certbot:
+
+certbot_tls  | Saving debug log to /var/log/letsencrypt/letsencrypt.log
+certbot_tls  | Requesting a certificate for mqtt.tudominio.com
+certbot_tls  | Successfully received certificate.
+certbot_tls  | ✅ Certs listos en ./emqx-certs del host
+
+Etapa 2 — EMQX:
+
+emqx_tls  | EMQX 5.6.x is running now!
+emqx_tls  | Listener ssl:default on 0.0.0.0:8883 started.
+
+Si certbot falla
+
+Los errores más comunes:
+
+Error: connection refused en el puerto 80
+
+Could not bind to IPv4 or IPv6... [Errno 98] Address already in use
+
+Solución: otro proceso está usando el puerto 80. En el servidor: sudo lsof -i :80 para identificarlo.
+
+Error: DNS no resuelve al servidor
+
+Failed to connect to host for DVSNI challenge
+
+Solución: el dominio no apunta a este servidor. Verifica con nslookup mqtt.tudominio.com desde otro computador.
+
+Error: rate limit de Let's Encrypt
+
+too many certificates already issued
+
+Solución: Let's Encrypt permite 5 certificados por dominio por semana. Para pruebas, agrega --staging al comando certbot.
+Verifica que EMQX cargó los certificados
+
+Desde tu computador local:
+
+openssl s_client -connect mqtt.tudominio.com:8883 -servername mqtt.tudominio.com
+
+Busca en la salida:
+
+Certificate chain
+ 0 s:CN = mqtt.tudominio.com
+   i:C = US, O = Let's Encrypt, CN = R10
+Verification: OK
+
+Si ves Verification: OK, el certificado TLS está funcionando correctamente.
+Accede al Dashboard de EMQX
+
+Abre en tu navegador:
+
+http://mqtt.tudominio.com:18083
+
+Entra con las credenciales de tu .env. Desde aquí puedes:
+
+    Ver clientes conectados en tiempo real
+    Crear usuarios MQTT
+    Monitorear el tráfico de topics
+    Ver las reglas ACL activas
+
+Crea los usuarios MQTT desde el Dashboard: Acceso → Autenticación → Base de datos interna → Agregar. Crea al menos un usuario `sensor_01` y un usuario `admin2` para las pruebas.
+Checkpoint ✅
+
+    [ ] docker compose up terminó sin errores.
+    [ ] La salida de certbot muestra ✅ Certs listos.
+    [ ] La salida de EMQX muestra Listener ssl:default on 0.0.0.0:8883 started.
+    [ ] openssl s_client muestra Verification: OK.
+    [ ] Puedo acceder al Dashboard en el puerto 18083.
+    [ ] Creé los usuarios sensor_01 y admin2 en el Dashboard.
+
+
+11. Prueba la conexión segura
+
+Desde tu computador local vamos a probar que todo funciona: TLS, autenticación y ACL.
+Abre dos terminales
+
+Necesitas dos terminales abiertas al mismo tiempo.
+Terminal 1 — Suscriptor (simula el backend)
+
+mosquitto_sub \
+  -h mqtt.tudominio.com \
+  -p 8883 \
+  -u sensor_01 \
+  -P tu_contraseña \
+  -t "co/bogota/edificio5/piso3/sensor_01/out" \
+  --tls-version tlsv1.2 \
+  -v
+
+La bandera -v muestra también el topic en cada mensaje recibido.
+
+Este comando se queda esperando mensajes. No verás output hasta que alguien publique.
+Terminal 2 — Publicador (simula el sensor)
+
+mosquitto_pub \
+  -h mqtt.tudominio.com \
+  -p 8883 \
+  -u sensor_01 \
+  -P tu_contraseña \
+  -t "co/bogota/edificio5/piso3/sensor_01/out" \
+  -m '{"temperatura": 23.5, "humedad": 65, "ts": 1700000000}' \
+  --tls-version tlsv1.2
+
+En la Terminal 1 debes ver:
+
+co/bogota/edificio5/piso3/sensor_01/out {"temperatura": 23.5, "humedad": 65, "ts": 1700000000}
+
+Verifica que la ACL funciona: intenta publicar en un topic ajeno
+
+mosquitto_pub \
+  -h mqtt.tudominio.com \
+  -p 8883 \
+  -u sensor_01 \
+  -P tu_contraseña \
+  -t "co/bogota/edificio5/piso3/sensor_02/out" \
+  -m "intento de intrusion" \
+  --tls-version tlsv1.2
+
+Este comando debe fallar con:
+
+Error: Connection refused
+
+o simplemente no llegar al suscriptor. La ACL está funcionando.
+Prueba con un certificado inválido (sin –tls-version)
+
+Para entender la diferencia, intenta conectarte al puerto 1883 (si está deshabilitado):
+
+mosquitto_pub -h mqtt.tudominio.com -p 1883 -u sensor_01 -P tu_contraseña \
+  -t "test" -m "sin tls"
+
+Debe fallar con Connection refused porque el puerto 1883 no está publicado en el compose.
+Interpretación de los flags de mosquitto
+
+Flag
+	
+
+Significado
+
+-h
+	
+
+Host del broker
+
+-p
+	
+
+Puerto (8883 para MQTT TLS)
+
+-u
+	
+
+Nombre de usuario MQTT
+
+-P
+	
+
+Contraseña MQTT
+
+-t
+	
+
+Topic
+
+-m
+	
+
+Mensaje a publicar
+
+–tls-version
+	
+
+Versión de TLS (tlsv1.2 o tlsv1.3)
+
+-v
+	
+
+Verbose: muestra topic en mensajes recibidos
+
+-q
+	
+
+QoS (0, 1 o 2)
+Checkpoint ✅
+
+    [ ] mosquitto_sub recibe mensajes publicados con mosquitto_pub en el mismo topic.
+    [ ] mosquitto_pub con usuario sensor_01 falla al intentar publicar en el topic de sensor_02.
+    [ ] La conexión usa TLS (si quito --tls-version, la conexión falla en el puerto 8883 sin TLS).
+
+
+12. Renovación del certificado
+
+Los certificados de Let's Encrypt duran 90 días. Antes de que expiren debes renovarlos.
+Opción 1 — Renovación manual
+
+Cuando quieras renovar:
+
+cd ~/mqtt-project
+
+# Detén EMQX para liberar el puerto 80 si lo necesita
+docker compose stop emqx
+
+# Ejecuta certbot en modo renovación
+docker compose run --rm certbot renew
+
+# Reinicia EMQX con los nuevos certificados
+docker compose start emqx
+
+En realidad, certbot con `--standalone` levanta su propio servidor web en el puerto 80. No necesita que EMQX esté detenido a menos que EMQX también use el puerto 80, lo cual no es el caso en nuestra configuración.
+Opción 2 — Renovación automática con cron
+
+En el servidor, agrega una tarea cron para renovar cada semana (certbot es inteligente: no renueva si el certificado tiene más de 60 días de vigencia):
+
+crontab -e
+
+Agrega esta línea:
+
+0 3 * * 0 cd /home/ubuntu/mqtt-project && docker compose run --rm certbot renew >> /var/log/certbot-renew.log 2>&1
+
+Esto ejecuta la renovación todos los domingos a las 3 AM.
+Verifica la fecha de expiración del certificado
+
+Desde tu computador local:
+
+echo | openssl s_client -connect mqtt.tudominio.com:8883 -servername mqtt.tudominio.com 2>/dev/null \
+  | openssl x509 -noout -dates
+
+Verás:
+
+notBefore=Oct 15 00:00:00 2024 GMT
+notAfter=Jan 13 00:00:00 2025 GMT
+
+
+13. Ejercicio integrador
+
+Pon en práctica todo lo aprendido aplicándolo a tu propio escenario IoT.
+Escenario del ejercicio
+
+Tienes una red de 3 sensores en un edificio universitario:
+
+    sensor_temp_lab1 — mide temperatura del laboratorio 1
+    sensor_temp_lab2 — mide temperatura del laboratorio 2
+    sensor_co2_entrada — mide CO2 en la entrada del edificio
+
+El sistema backend (backend_univ) debe poder:
+
+    Leer datos de todos los sensores
+    Enviar comandos de calibración a cada sensor individualmente
+
+10.1 — Diseña la jerarquía de topics
+
+Completa la tabla con los topics que usarías:
+
+Propósito
+	
+
+Topic
+
+sensor_temp_lab1 publica temperatura
+	
+
+sensor_temp_lab2 publica temperatura
+	
+
+sensor_co2_entrada publica CO2
+	
+
+backend envía comando a sensor_temp_lab1
+	
+
+backend se suscribe a todos los datos
+	
+10.2 — Escribe las reglas ACL
+
+Completa el archivo ACL para este escenario. Recuerda:
+
+    Cada sensor solo publica en su propio topic.
+    El backend puede leer todos los topics de salida.
+    El backend puede enviar comandos a cualquier sensor.
+    Nadie más puede leer ni escribir.
+
+%% Sensores: solo publican en su propio canal de salida
+{allow, all, _______, ["tu/topic/${username}/______"]}.
+
+%% Backend: lee todos los datos
+{allow, {username, "backend_univ"}, _______, ["______/#"]}.
+
+%% Backend: envía comandos a cualquier sensor
+{allow, {username, "backend_univ"}, _______, ["______/+/_______/in"]}.
+
+%% Bloqueos de seguridad
+{deny, all, subscribe, ["$SYS/#", {eq, "#"}]}.
+{deny, all}.
+
+10.3 — Prueba la conexión desde tu computador
+
+    Crea los usuarios sensor_temp_lab1, sensor_temp_lab2, sensor_co2_entrada y backend_univ en el Dashboard de EMQX.
+    Suscribe al backend a los datos:
+
+mosquitto_sub -h mqtt.tudominio.com -p 8883 \
+  -u backend_univ -P contraseña_backend \
+  -t "univ/edificio1/+/+/+/out" \
+  --tls-version tlsv1.2 -v
+
+    Publica desde el sensor de temperatura:
+
+mosquitto_pub -h mqtt.tudominio.com -p 8883 \
+  -u sensor_temp_lab1 -P contraseña_sensor \
+  -t "univ/edificio1/piso2/lab1/sensor_temp_lab1/out" \
+  -m '{"temperatura": 22.1, "unidad": "celsius"}' \
+  --tls-version tlsv1.2
+
+    Verifica que el backend lo recibe.
+    Verifica que sensor_temp_lab1 no puede publicar en el topic de sensor_temp_lab2.
+
+10.4 — Verifica el certificado TLS
+
+echo | openssl s_client -connect mqtt.tudominio.com:8883 \
+  -servername mqtt.tudominio.com 2>/dev/null | openssl x509 -noout -text \
+  | grep -A2 "Subject:"
+
+Anota la fecha de expiración del certificado.
+10.5 — Configura la renovación automática
+
+Configura la tarea cron para renovar el certificado automáticamente. Verifica que se haya guardado:
+
+crontab -l
+
+Rúbrica de evaluación (100 pts)
+
+Criterio
+	
+
+Puntos
+	
+
+Descripción
+
+Jerarquía de topics
+	
+
+15
+	
+
+Topics coherentes con la estructura `+/+/+/+/${username}/in
+
+Reglas ACL correctas
+	
+
+30
+	
+
+Cada sensor aislado, backend con acceso apropiado, deny final
+
+Prueba exitosa de pub/sub
+	
+
+20
+	
+
+mosquitto_pub envía y mosquitto_sub recibe correctamente
+
+Prueba de ACL bloqueando
+	
+
+20
+	
+
+Sensor no puede publicar en topic de otro sensor
+
+Verificación TLS
+	
+
+10
+	
+
+openssl s_client muestra Verification: OK y fecha correcta
+
+Renovación automática
+	
+
+5
+	
+
+crontab configurado correctamente
+Criterios de aceptación del ejercicio
+
+    [ ] Los topics siguen la jerarquía de al menos 5 niveles definida.
+    [ ] Las reglas ACL usan ${username} correctamente para aislar sensores.
+    [ ] El backend puede leer datos de todos los sensores con una sola suscripción wildcard.
+    [ ] Un sensor no puede publicar en el topic de otro sensor (ACL lo bloquea).
+    [ ] La conexión usa TLS y el certificado es válido (Verification: OK).
+    [ ] La renovación automática está configurada con cron.
+
+
+14. Referencia Rápida
+Comandos Docker Compose
+
+# Primera vez: levanta certbot y emqx
+docker compose up
+
+# En background, después de verificar que funciona
+docker compose up -d
+
+# Ver logs de EMQX
+docker logs -f emqx_tls
+
+# Reiniciar EMQX (aplica cambios en acl.conf)
+docker compose restart emqx
+
+# Detener todo
+docker compose down
+
+# Detener y borrar volúmenes (¡borra datos!)
+docker compose down -v
+
+Comandos mosquitto
+
+# Suscribirse con TLS
+mosquitto_sub -h BROKER -p 8883 -u USUARIO -P PASS \
+  -t "topic/+/out" --tls-version tlsv1.2 -v
+
+# Publicar con TLS
+mosquitto_pub -h BROKER -p 8883 -u USUARIO -P PASS \
+  -t "mi/topic/out" -m "mensaje" --tls-version tlsv1.2
+
+# Suscribirse con QoS 1
+mosquitto_sub -h BROKER -p 8883 -u USUARIO -P PASS \
+  -t "topic" -q 1 --tls-version tlsv1.2
+
+# Publicar con QoS 2
+mosquitto_pub -h BROKER -p 8883 -u USUARIO -P PASS \
+  -t "topic" -m "msg" -q 2 --tls-version tlsv1.2
+
+Diagnóstico TLS
+
+# Verificar certificado
+openssl s_client -connect broker.dominio.com:8883 -servername broker.dominio.com
+
+# Ver fecha de expiración
+echo | openssl s_client -connect broker.dominio.com:8883 2>/dev/null \
+  | openssl x509 -noout -dates
+
+# Verificar que el puerto está abierto
+nc -zv broker.dominio.com 8883
+
+Puertos MQTT
+
+Puerto
+	
+
+Protocolo
+	
+
+Estado en este codelab
+
+1883
+	
+
+MQTT sin TLS
+	
+
+Deshabilitado (no publicado en compose)
+
+8883
+	
+
+MQTT sobre TLS
+	
+
+Activo ✅
+
+8083
+	
+
+MQTT sobre WebSocket
+	
+
+Deshabilitado
+
+8084
+	
+
+MQTT sobre WebSocket TLS
+	
+
+Deshabilitado
+
+18083
+	
+
+Dashboard EMQX
+	
+
+Activo ✅
+Comodines de ACL
+
+Patrón en ACL
+	
+
+Coincide con
+
++/+/+/+/${username}/out
+	
+
+cualquier jerarquía de 4 niveles + username propio + out
+
+org/#
+	
+
+todo lo que empieza con org/
+
+{eq, "#"}
+	
+
+exactamente el string # (no como comodín)
+
+$SYS/#
+	
+
+todos los topics internos de EMQX
+
+15. Felicitaciones
+
+Tienes un broker MQTT de producción corriendo con TLS válido y control de acceso granular. Este es exactamente el mismo stack que usan equipos profesionales de IoT.
+Lo que aprendiste
+
+    MQTT es un protocolo pub/sub eficiente para dispositivos con recursos limitados.
+    El broker es el intermediario central que recibe, filtra y reenvía mensajes.
+    TLS cifra todo el tráfico; un certificado de Let's Encrypt es gratis y suficiente para producción.
+    La ACL en EMQX usa ${username} para aislar automáticamente cada dispositivo en su propio espacio de topics.
+    Las reglas ACL se evalúan de arriba a abajo; la primera que coincide gana.
+    Docker Compose orquesta certbot y EMQX garantizando que los certificados existan antes de que el broker arranque.
+
+Qué sigue
+
+    Autenticación por base de datos: conectar EMQX a PostgreSQL o Redis para gestionar miles de dispositivos sin tocar el Dashboard.
+    Mutual TLS (mTLS): cada dispositivo tiene su propio certificado de cliente, eliminando las contraseñas.
+    EMQX Rules Engine: procesar y transformar mensajes en tiempo real, reenviarlos a bases de datos de series temporales (InfluxDB, TimescaleDB).
+    Clustering EMQX: escalar horizontalmente a múltiples nodos para millones de conexiones.
+    MQTT 5.0: propiedades de mensaje, suscripciones compartidas y respuestas de error descriptivas.
+
+Recursos recomendados
+
+    Documentación oficial de EMQX: emqx.io/docs
+    HiveMQ MQTT Essentials: guía conceptual completa
+    Let's Encrypt documentation: letsencrypt.org/docs
+    Herramienta visual de topics MQTT: mqtt-explorer.com (desktop app)

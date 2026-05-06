@@ -25,7 +25,7 @@ void reconnect() {
 
         // PASO 1: Configurar el certificado raíz
         // Esto le dice al ESP32 qué autoridad certificadora confiar
-        //espClient.setCACert(root_ca); // se necesita el certificado raíz del broker MQTT para validar su identidad
+        espClient.setCACert(root_ca); // se necesita el certificado raíz del broker MQTT para validar su identidad
 
         // PASO 2: Intentar la conexión MQTT
         // El cliente_id identifica a este dispositivo en el broker

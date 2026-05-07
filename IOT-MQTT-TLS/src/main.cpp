@@ -25,21 +25,40 @@ const unsigned long PUBLISH_INTERVAL = 10000; // 10 segundos
 void setup_wifi() {
   delay(10);
   Serial.println();
+  Serial.println("-----------------------------------------");
   Serial.print("Conectando a WiFi: ");
   Serial.println(WIFI_SSID_VALUE);
 
+  // Configuraciones de robustez para ESP32
+  WiFi.disconnect(true); 
+  delay(1000);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // Desactivar ahorro de energía ayuda con la estabilidad en hotspots
+
   WiFi.begin(WIFI_SSID_VALUE, WIFI_PASSWORD_VALUE);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  int timeout_counter = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout_counter < 60) { // 30 segundos max
     delay(500);
     Serial.print(".");
+    timeout_counter++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[ERROR] No se pudo conectar. Posibles causas:");
+    Serial.println("1. Hotspot en 5GHz (Cambia a 2.4GHz / 'Maximizar compatibilidad')");
+    Serial.println("2. Contraseña incorrecta");
+    Serial.println("3. Señal debil");
+    Serial.println("Reiniciando ESP32...");
+    delay(3000);
+    ESP.restart();
   }
 
   Serial.println("");
   Serial.println("WiFi conectado!");
   Serial.print("Direccion IP: ");
   Serial.println(WiFi.localIP());
+  Serial.println("-----------------------------------------");
 }
 
 void setup() {
@@ -47,36 +66,33 @@ void setup() {
   delay(2000);
   Serial.println("\n\n--- INICIANDO ESP32 SIGMOTOS (VERSION OTA MAGICA) ---");
 
-  // Inicializamos el bus I2C — SDA=GPIO8, SCL=GPIO9
+  // Inicializamos el bus I2C — SDA=GPIO 8, SCL=GPIO 9 (con pull-ups internos)
   pinMode(8, INPUT_PULLUP);
   pinMode(9, INPUT_PULLUP);
   Wire.begin(8, 9);
 
-  // === ESCANER I2C REPETITIVO para detectar el sensor en vivo ===
-  Serial.println("Escaneando bus I2C (se repetira hasta encontrar algo)...");
-  bool found = false;
-  while (!found) {
-    int deviceCount = 0;
-    for (byte addr = 1; addr < 127; addr++) {
-      Wire.beginTransmission(addr);
-      if (Wire.endTransmission() == 0) {
-        Serial.print("  [!] DISPOSITIVO ENCONTRADO en 0x");
-        Serial.println(addr, HEX);
-        deviceCount++;
-        found = true;
-      }
-    }
-    if (!found) {
-      Serial.println("  . (No hay nada... revisa los cables)");
-      delay(2000);
+  // === ESCANER I2C para detectar la dirección del sensor ===
+  Serial.println("Escaneando bus I2C...");
+  int deviceCount = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    byte error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("  Dispositivo encontrado en 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.println(addr, HEX);
+      deviceCount++;
     }
   }
-  Serial.println("Escaneo finalizado con exito.");
+  if (deviceCount == 0) {
+    Serial.println("  [!] Ningun dispositivo I2C encontrado. Revisa el cableado.");
+  }
+  Serial.println("Escaneo finalizado.");
   // ==========================================================
 
-  // Inicializamos el sensor SHT31
+  // Inicializamos el sensor SHT31 (dirección I2C 0x44)
   if (!sht.begin()) {
-    Serial.println("[ERROR] Sensor SHT3X no encontrado al iniciar.");
+    Serial.println("[ERROR] Sensor SHT3X no encontrado. Verifica la conexion I2C.");
   } else {
     Serial.println("Sensor SHT3X inicializado OK");
   }

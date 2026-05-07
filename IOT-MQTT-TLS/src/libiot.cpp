@@ -36,7 +36,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.println("Contenido: " + message);
 
     // Parseamos el JSON para buscar la URL del OTA
-    StaticJsonDocument<512> doc;
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, message);
 
     if (error) {
